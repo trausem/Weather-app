@@ -1,0 +1,297 @@
+import os
+import sys
+import re
+import time
+import argparse
+import logging
+import fitz
+from dotenv import load_dotenv
+from openai import OpenAI
+from ebooklib import epub
+from bs4 import BeautifulSoup
+
+SYSTEM_PROMPT = (
+    "Jesteś profesjonalnym tłumaczem technicznym i literackim. "
+    "Przetłumacz poniższy tekst z języka angielskiego na język polski. "
+    "Zasady:\n"
+    "- Zachowaj dokładny podział na akapity i linie.\n"
+    "- Nie dodawaj żadnych komentarzy, nagłówków ani wyjaśnień.\n"
+    "- Nie streszczaj i nie pomijaj treści.\n"
+    "- Zachowaj formatowanie (np. wypunktowania, numery).\n"
+    "- Zwróć wyłącznie przetłumaczony tekst, bez cudzysłowów otaczających odpowiedź.\n"
+)
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+def find_unicode_font():
+    candidates = [
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\calibri.ttf",
+        r"C:\Windows\Fonts\tahoma.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            logging.info(f"Font found: {path}")
+            return path
+    return None
+
+def extract_pages_pdf(pdf_path: str):
+    doc = fitz.open(pdf_path)
+    pages = []
+    for i, page in enumerate(doc):
+        text = page.get_text("text").strip()
+        pages.append({"page_num": i + 1, "text": text})
+    doc.close()
+    return pages
+
+def smart_chunk(text: str, max_len: int = 3000):
+    paragraphs = text.split("\n")
+    chunks = []
+    current = []
+    current_len = 0
+
+    for para in paragraphs:
+        stripped = para.strip()
+        if not stripped:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            continue
+
+        if len(stripped) > max_len:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            sentences = re.split(r"(?<=[.!?]) +", stripped)
+            sub = []
+            sub_len = 0
+            for sent in sentences:
+                if sub_len + len(sent) + 1 > max_len and sub:
+                    chunks.append(" ".join(sub))
+                    sub = [sent]
+                    sub_len = len(sent)
+                else:
+                    sub.append(sent)
+                    sub_len += len(sent) + 1
+            if sub:
+                chunks.append(" ".join(sub))
+            continue
+
+        if current_len + len(stripped) + 1 > max_len and current:
+            chunks.append("\n".join(current))
+            current = [stripped]
+            current_len = len(stripped)
+        else:
+            current.append(stripped)
+            current_len += len(stripped) + 1
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+def translate_chunk(client: OpenAI, model: str, text: str, retries: int = 3):
+    if not text.strip():
+        return ""
+
+    for attempt in range(retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.2,
+                max_tokens=4096,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            wait = 2 ** attempt
+            logging.warning(f"API Error ({attempt + 1}/{retries}): {e}. Waiting {wait}s...")
+            time.sleep(wait)
+    raise RuntimeError("Translation failed.")
+
+def insert_text_to_pdf_pages(out_doc, text: str, header_label: str, font_path, fontsize: int = 11):
+    text_kwargs = {"fontfile": font_path} if font_path else {"fontname": "helv"}
+    lines = text.splitlines()
+    page_index = 1
+
+    while lines:
+        page = out_doc.new_page(width=595, height=842)
+        label = header_label + (f" (cd. {page_index})" if page_index > 1 else "")
+        page.insert_textbox(
+            fitz.Rect(50, 20, 545, 40),
+            label,
+            fontsize=9,
+            align=fitz.TEXT_ALIGN_LEFT,
+            **text_kwargs,
+        )
+        rect = fitz.Rect(50, 45, 545, 800)
+        lo, hi = 1, len(lines)
+        fitted = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = "\n".join(lines[:mid])
+            rc = page.insert_textbox(
+                rect, candidate, fontsize=fontsize,
+                align=fitz.TEXT_ALIGN_LEFT, **text_kwargs,
+            )
+            if rc >= 0:
+                fitted = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        if fitted == 0:
+            fitted = 1
+
+        final_text = "\n".join(lines[:fitted])
+        page.insert_textbox(
+            rect, final_text, fontsize=fontsize,
+            align=fitz.TEXT_ALIGN_LEFT, **text_kwargs,
+        )
+        lines = lines[fitted:]
+        page_index += 1
+
+def process_pdf(client, model, chunk_size, input_path, output_path):
+    font_path = find_unicode_font()
+    pages = extract_pages_pdf(input_path)
+    total_pages = len(pages)
+    out_doc = fitz.open()
+    translated_count = 0
+
+    for idx, item in enumerate(pages, start=1):
+        page_num = item["page_num"]
+        text = item["text"]
+        header = f"Original page {page_num}"
+        logging.info(f"[{idx}/{total_pages}] Page {page_num}...")
+
+        if not text:
+            page = out_doc.new_page(width=595, height=842)
+            rect = fitz.Rect(50, 380, 545, 420)
+            text_kwargs = {"fontfile": font_path} if font_path else {"fontname": "helv"}
+            page.insert_textbox(rect, f"{header}\n[No text]", fontsize=11,
+                                align=fitz.TEXT_ALIGN_LEFT, **text_kwargs)
+            continue
+
+        chunks = smart_chunk(text, max_len=chunk_size)
+        translated_parts = []
+        for cidx, chunk in enumerate(chunks, start=1):
+            translated_parts.append(translate_chunk(client, model, chunk))
+            time.sleep(0.1)
+
+        full_translation = "\n\n".join(p for p in translated_parts if p)
+        insert_text_to_pdf_pages(out_doc, full_translation, header, font_path)
+        translated_count += 1
+
+    out_doc.save(output_path)
+    out_doc.close()
+
+def process_epub(client, model, chunk_size, input_path, output_path):
+    book = epub.read_epub(input_path)
+    items_count = 0
+
+    for item in book.get_items():
+        if not isinstance(item, epub.EpubHtml):
+            continue
+
+        content = item.content
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+
+        soup = BeautifulSoup(content, "lxml")
+        body = soup.find("body")
+        if not body:
+            continue
+
+        text_nodes = []
+        for tag in body.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th", "span", "div"]):
+            raw = tag.get_text(separator=" ", strip=True)
+            if raw:
+                text_nodes.append((tag, raw))
+
+        if not text_nodes:
+            continue
+
+        items_count += 1
+        logging.info(f"Chapter: {item.get_name()}")
+
+        combined = "\n\n".join(raw for _, raw in text_nodes)
+        chunks = smart_chunk(combined, max_len=chunk_size)
+
+        translated_parts = []
+        for cidx, chunk in enumerate(chunks, start=1):
+            translated_parts.append(translate_chunk(client, model, chunk))
+            time.sleep(0.1)
+
+        translated_full = "\n\n".join(p for p in translated_parts if p)
+        translated_paragraphs = [p.strip() for p in translated_full.split("\n\n") if p.strip()]
+
+        for i, (tag, _) in enumerate(text_nodes):
+            if i < len(translated_paragraphs):
+                tag.clear()
+                tag.append(BeautifulSoup(translated_paragraphs[i], "lxml").get_text())
+
+        item.content = str(soup).encode("utf-8")
+
+    epub.write_epub(output_path, book, {})
+
+def main():
+    load_dotenv()
+    setup_logging()
+
+    parser = argparse.ArgumentParser(description="EN -> PL Translator via OpenAI")
+    parser.add_argument("input", help="Input file path")
+    parser.add_argument("output", help="Output file path")
+    parser.add_argument("--format", choices=["auto", "pdf", "epub"], default="auto")
+    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    parser.add_argument("--key", default=os.getenv("OPENAI_API_KEY"))
+    parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL", ""))
+    parser.add_argument("--chunk-size", type=int, default=3000)
+    args = parser.parse_args()
+
+    if not args.key:
+        logging.error("API Key missing.")
+        sys.exit(1)
+    
+    if not os.path.exists(args.input):
+        logging.error(f"File not found: {args.input}")
+        sys.exit(1)
+
+    base_url = args.base_url
+    if not base_url and args.key.startswith("sk-or-v1-"):
+        base_url = "https://openrouter.ai/api/v1"
+
+    client_kwargs = {"api_key": args.key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    client = OpenAI(**client_kwargs)
+
+    fmt = args.format
+    if fmt == "auto":
+        ext = os.path.splitext(args.input)[1].lower()
+        if ext == ".pdf": fmt = "pdf"
+        elif ext == ".epub": fmt = "epub"
+        else:
+            sys.exit(1)
+
+    if fmt == "pdf":
+        process_pdf(client, args.model, args.chunk_size, args.input, args.output)
+    elif fmt == "epub":
+        process_epub(client, args.model, args.chunk_size, args.input, args.output)
+
+if __name__ == "__main__":
+    main()
